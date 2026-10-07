@@ -35,6 +35,13 @@ class Settings:
     max_restore_bytes: int = field(
         default_factory=lambda: _int_env("MAX_RESTORE_MB", 512) * 1024 * 1024
     )
+    # 定时公开前内审预览凭证的**本地管理员密钥**（环境变量 PREVIEW_ADMIN_KEY）。
+    # 未设置或为纯空白时，凭证颁发端点一律拒绝（fail-closed）；领取端点只需
+    # 持一次性凭证、不使用本密钥。密钥不写入数据库，也不进入服务数据归档。
+    preview_admin_key: str | None = field(
+        default_factory=lambda: (os.environ.get("PREVIEW_ADMIN_KEY") or "").strip()
+        or None
+    )
 
     @property
     def db_path(self) -> str:

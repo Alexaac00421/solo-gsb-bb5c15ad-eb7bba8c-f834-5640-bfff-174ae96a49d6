@@ -25,6 +25,10 @@
   写入互不干扰；事务纯只读，不产生版本、不写入任何改动记录。归档还会在该事务
   内读取引用文件（原图/成品）并复算摘要：这些文件落盘后不可变，故快照记录与
   文件字节同属一个一致时点；读盘期间不持写锁，并发写入同样不受阻塞。
+- 预览凭证（preview_tokens）只以 SHA-256 摘要形式落库；颁发只插入、领取的
+  "校验+核销"在同一个 ``BEGIN IMMEDIATE`` 事务内以一条条件 UPDATE 完成，
+  并发领取恰好一笔核销成功。该表不属于服务数据：归档不导出它，恢复在空实例
+  写事务内清空它，旧凭证恢复后无法沿用。
 """
 from __future__ import annotations
 
@@ -103,6 +107,20 @@ CREATE TABLE IF NOT EXISTS publication_withdrawals (
     reason       TEXT NOT NULL,             -- 首次撤回时的原因（重复撤回不改写）
     withdrawn_at TEXT NOT NULL,             -- 首次撤回时间
     PRIMARY KEY (doc_id, version),
+    FOREIGN KEY (doc_id, version) REFERENCES publications(doc_id, version)
+);
+
+-- 定时公开前的内审预览凭证：只保存凭证摘要，绝不保存明文凭证本身。
+-- 行仅存活于本机：服务数据归档不导出本表，归档恢复在空实例写事务内
+-- 清空本表，恢复后任何旧凭证一律失效。凭证一次性、带过期时间，核销与
+-- 校验在同一个 BEGIN IMMEDIATE 事务内原子完成。
+CREATE TABLE IF NOT EXISTS preview_tokens (
+    token_hash  TEXT PRIMARY KEY,           -- 明文凭证的 SHA-256（唯一落库形式）
+    doc_id      TEXT NOT NULL,
+    version     INTEGER NOT NULL,
+    expires_at  TEXT NOT NULL,              -- 凭证截止时间（统一 UTC ISO，尾部 Z）
+    created_at  TEXT NOT NULL,
+    redeemed_at TEXT,                       -- 核销时间；NULL=尚未使用
     FOREIGN KEY (doc_id, version) REFERENCES publications(doc_id, version)
 );
 """

@@ -102,3 +102,16 @@ class CoverageDiffRequest(BaseModel):
 
     revision: int = Field(ge=0)
     baseline_version: int = Field(ge=1)
+
+
+class PreviewTokenRequest(BaseModel):
+    """定时公开前的内审预览凭证颁发请求（管理员）。
+
+    携带目标文档 ID、已生成的脱敏版本号与 1～60 分钟的凭证有效期（分钟，
+    整数）。语义校验（版本存在、未撤回、设置了未来公开时间）在写事务内
+    统一返回业务错误码。
+    """
+
+    doc_id: str = Field(min_length=1, max_length=64)
+    version: int = Field(ge=1)
+    ttl_minutes: int = Field(ge=1, le=60)
