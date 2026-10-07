@@ -102,3 +102,16 @@ class CoverageDiffRequest(BaseModel):
 
     revision: int = Field(ge=0)
     baseline_version: int = Field(ge=1)
+
+
+class PreviewTokenRequest(BaseModel):
+    """内审预览凭证颁发请求：文档 ID、版本号与 1～60 分钟有效期。
+
+    管理密钥经请求头 ``X-Preview-Admin-Key`` 提交（不入请求体，避免进入
+    访问日志的 JSON 记录）；有效期边界等业务校验在路由内完成，以返回统一
+    格式的业务错误码。
+    """
+
+    doc_id: str = Field(min_length=1, max_length=64)
+    version: int = Field(ge=1)
+    expires_in_minutes: int

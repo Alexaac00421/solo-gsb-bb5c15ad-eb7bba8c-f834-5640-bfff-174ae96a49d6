@@ -1,10 +1,13 @@
 """HTTP API：上传、标注（乐观锁修订）、发布（事务内涂实）、撤回、公开读取、
-离线交付包与服务数据归档（同一数据库快照）。"""
+离线交付包、内审预览凭证（定时公开前的一次性预览包）与服务数据归档
+（同一数据库快照）。"""
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
+import secrets
 import sqlite3
 import tempfile
 import uuid
@@ -13,7 +16,15 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    Body,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    UploadFile,
+)
 from fastapi.responses import FileResponse, Response
 
 from .archive_restore import load_restore_plan
@@ -35,6 +46,7 @@ from .models import (
     CoverageDiffRequest,
     MigrationRequest,
     PackageRequest,
+    PreviewTokenRequest,
     PublishRequest,
     WithdrawRequest,
 )
@@ -63,6 +75,11 @@ ARCHIVE_SNAPSHOT_HOOK: Any = None
 # 判定与现有写操作、其他恢复之间的串行顺序。
 RESTORE_EMPTY_CHECK_HOOK: Any = None
 
+# 预览领取"凭证校验与撤回/公开时间复查完毕（写锁/写事务内）-> 成品读盘、
+# 核销与打包"之间的钩子。生产中为空操作；并发测试借此在核销前发起撤回，
+# 验证领取与撤回的串行顺序（领取先核销则本次下载完成，撤回随后生效）。
+PREVIEW_CLAIM_HOOK: Any = None
+
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -73,8 +90,8 @@ def _now_dt() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _stored_publish_at_dt(value: str) -> datetime:
-    """解析库内规范化存储的公开时间（UTC ISO 8601，尾部 Z）。"""
+def _stored_utc_dt(value: str) -> datetime:
+    """解析库内规范化存储的 UTC 时间（ISO 8601，尾部 Z 或 +00:00）。"""
     return datetime.fromisoformat(value)
 
 
@@ -394,7 +411,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         撤回检查——永久撤回优先于公开时间，撤回版本一律 410。
         """
         publish_at = pub["publish_at"]
-        if publish_at is not None and _stored_publish_at_dt(
+        if publish_at is not None and _stored_utc_dt(
             publish_at
         ) > _now_dt():
             extra: dict[str, Any] = {
@@ -1473,6 +1490,255 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             filename="publication-package.zip",
         )
 
+    # ---------------- 内审预览凭证（定时公开前的一次性预览包） ----------------
+
+    def _require_preview_admin_key(provided: str | None) -> None:
+        """校验请求头携带的管理密钥（本地 PREVIEW_ADMIN_KEY 配置）。
+
+        服务端未配置密钥时颁发端点整体不可用（503）；请求未携带或携带错误
+        密钥时一律 401，不区分"缺失"与"错误"，也不泄露是否已配置之外的
+        任何信息。比较使用恒定时间算法，避免时序侧信道。
+        """
+        configured = settings.preview_admin_key
+        if not configured:
+            _error(
+                503,
+                "preview_admin_key_not_configured",
+                "preview token issuance is disabled: PREVIEW_ADMIN_KEY is not"
+                " configured on this service",
+            )
+        if provided is None or not hmac.compare_digest(
+            provided.encode("utf-8"), configured.encode("utf-8")
+        ):
+            _error(
+                401,
+                "preview_admin_key_invalid",
+                "missing or invalid preview admin key",
+            )
+
+    @app.post("/publication-previews", status_code=201)
+    def issue_preview_token(
+        body: PreviewTokenRequest,
+        x_preview_admin_key: str | None = Header(default=None),
+    ) -> dict:
+        """为**未到公开时间**的已发布版本颁发一次性内审预览凭证。
+
+        管理员凭本地配置的密钥（请求头 ``X-Preview-Admin-Key``）提交文档
+        ID、版本号与 1～60 分钟有效期；成功返回凭证明文（仅此一次，服务端
+        只存 SHA-256 摘要）与截止时间。密钥缺失/错误、版本不存在、未设置
+        未来公开时间或版本已撤回均拒绝颁发，且不留下任何凭证记录。
+        """
+        _require_preview_admin_key(x_preview_admin_key)
+        if not 1 <= body.expires_in_minutes <= 60:
+            _error(
+                400,
+                "invalid_preview_ttl",
+                f"expires_in_minutes must be between 1 and 60, got"
+                f" {body.expires_in_minutes}",
+                expires_in_minutes=body.expires_in_minutes,
+            )
+
+        # 颁发与既有写操作（发布、撤回等）在同一写锁下串行：版本存在性、
+        # 撤回状态与公开时间的判定对应一个一致的已提交状态。
+        with write_tx(settings.db_path) as conn:
+            pub = _get_publication(conn, body.doc_id, body.version)
+            # 永久撤回优先（与公开读取同序）：已撤回版本拒绝颁发
+            _ensure_not_withdrawn(conn, body.doc_id, body.version)
+            publish_at = pub["publish_at"]
+            if publish_at is None or _stored_utc_dt(publish_at) <= _now_dt():
+                _error(
+                    409,
+                    "publication_not_scheduled",
+                    f"document '{body.doc_id}' version {body.version} has no"
+                    " future scheduled publish time; preview tokens are only"
+                    " issued for versions awaiting publication",
+                    doc_id=body.doc_id,
+                    version=body.version,
+                )
+            token = secrets.token_urlsafe(32)  # 256 位随机，URL 安全字符
+            digest = _sha256_bytes(token.encode("ascii"))
+            expires_at = (
+                (_now_dt() + timedelta(minutes=body.expires_in_minutes))
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z")
+            )
+            created_at = _utcnow()
+            conn.execute(
+                "INSERT INTO preview_tokens (token_digest, doc_id, version,"
+                " created_at, expires_at) VALUES (?,?,?,?,?)",
+                (digest, body.doc_id, body.version, created_at, expires_at),
+            )
+        return {
+            "token": token,  # 仅此一次返回明文；服务端只存摘要
+            "doc_id": body.doc_id,
+            "version": body.version,
+            "publish_at": publish_at,
+            "expires_at": expires_at,
+            "created_at": created_at,
+        }
+
+    @app.get("/publication-previews/{token}")
+    def claim_preview_package(
+        token: str,
+        background_tasks: BackgroundTasks,
+    ) -> FileResponse:
+        """凭一次性预览凭证领取预览包（ZIP：该版成品 PNG + 冻结遮盖信息）。
+
+        领取窗口为**凭证到期之前且版本公开时间到达之前**。凭证只按摘要
+        检索；"校验 -> 撤回复查 -> 成品摘要复查 -> 核销 -> 打包"全部在同
+        一个写事务内完成：并发领取只有一笔成功，与撤回互斥串行（撤回先
+        提交则本次拒绝，领取先核销则本次下载完成）。过期、已用、无效或
+        预览窗口已关闭的凭证统一返回 404，不泄露任何版本信息；预览包
+        绝不包含原图。
+        """
+        digest = _sha256_bytes(token.encode("ascii"))
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="preview-pkg-", suffix=".zip")
+        os.close(tmp_fd)
+        try:
+            # 校验、核销与打包同在一个 BEGIN IMMEDIATE 写事务内：与撤回、
+            # 发布、其他领取互斥串行；任何失败整体回滚，凭证不被误核销。
+            with write_tx(settings.db_path) as conn:
+                row = conn.execute(
+                    "SELECT doc_id, version, expires_at, used_at"
+                    " FROM preview_tokens WHERE token_digest = ?",
+                    (digest,),
+                ).fetchone()
+                now = _now_dt()
+                # 未知、已用、过期统一拒绝：同一错误体，不区分原因，
+                # 不携带任何版本信息。
+                if (
+                    row is None
+                    or row["used_at"] is not None
+                    or _stored_utc_dt(row["expires_at"]) <= now
+                ):
+                    _error(
+                        404,
+                        "preview_token_invalid",
+                        "preview token is invalid, expired, or already"
+                        " redeemed",
+                    )
+                doc_id, version = row["doc_id"], row["version"]
+                pub = conn.execute(
+                    "SELECT * FROM publications WHERE doc_id = ? AND version = ?",
+                    (doc_id, version),
+                ).fetchone()
+                if pub is None:
+                    # 发布记录永不删除，正常不会走到；防御性处理，同样
+                    # 不泄露版本信息。
+                    _error(
+                        404,
+                        "preview_token_invalid",
+                        "preview token is invalid, expired, or already"
+                        " redeemed",
+                    )
+                # 领取前再次检查撤回（与撤回写操作被写锁串行）：
+                # 撤回先提交则此处看到记录并拒绝。
+                _ensure_not_withdrawn(conn, doc_id, version)
+                # 公开时间到达后预览窗口关闭：与过期/已用/无效同形态拒绝，
+                # 不泄露版本信息（此后走常规公开读取即可）。
+                publish_at = pub["publish_at"]
+                if publish_at is None or _stored_utc_dt(publish_at) <= now:
+                    _error(
+                        404,
+                        "preview_token_invalid",
+                        "preview token is invalid, expired, or already"
+                        " redeemed",
+                    )
+
+                # 测试钩子：凭证校验与复查完毕、尚未读盘核销。
+                if PREVIEW_CLAIM_HOOK is not None:
+                    PREVIEW_CLAIM_HOOK()
+
+                # 领取前复查成品摘要：缺失/读盘失败/摘要不符都拒绝，
+                # 事务回滚，凭证保持未核销，可修复后重试。
+                path = pub["output_path"]
+                if not os.path.exists(path):
+                    _error(
+                        500,
+                        "artifact_missing",
+                        f"published artifact for document '{doc_id}' version"
+                        f" {version} is missing on disk",
+                        doc_id=doc_id,
+                        version=version,
+                    )
+                try:
+                    with open(path, "rb") as f:
+                        artifact = f.read()
+                except OSError as exc:
+                    _error(
+                        500,
+                        "artifact_read_failed",
+                        f"failed to read published artifact for document"
+                        f" '{doc_id}' version {version}: {exc}",
+                        doc_id=doc_id,
+                        version=version,
+                    )
+                actual_sha = _sha256_bytes(artifact)
+                if actual_sha != pub["output_sha256"]:
+                    _error(
+                        500,
+                        "artifact_corrupt",
+                        f"published artifact for document '{doc_id}' version"
+                        f" {version} failed integrity check",
+                        doc_id=doc_id,
+                        version=version,
+                    )
+
+                # 发布时冻结的遮盖信息：取发布行固化的标注修订，该修订
+                # 矩形追加存储、永不改写，不受后续标注修改影响。
+                rects = conn.execute(
+                    "SELECT x, y, w, h, reason FROM annotation_rects"
+                    " WHERE doc_id = ? AND revision = ? ORDER BY idx",
+                    (doc_id, pub["annotation_revision"]),
+                ).fetchall()
+
+                # 核销：与上述全部校验同一写事务——并发领取被写锁串行，
+                # 只有一笔能看到未核销状态；此后（含本次提交后）任何领取
+                # 都得到统一的 404。
+                conn.execute(
+                    "UPDATE preview_tokens SET used_at = ?"
+                    " WHERE token_digest = ?",
+                    (_utcnow(), digest),
+                )
+
+                # 预览包：仅该版成品 PNG 与发布时冻结的遮盖信息，
+                # 绝不包含原图；包内文件名只由服务端文档 ID 与版本号生成。
+                manifest = {
+                    "doc_id": doc_id,
+                    "version": version,
+                    "annotation_revision": pub["annotation_revision"],
+                    "output_sha256": actual_sha,
+                    "redaction_count": len(rects),
+                    "redactions": [_rect_out(r) for r in rects],
+                    "publish_at": publish_at,
+                    "generated_at": _utcnow(),
+                }
+                try:
+                    with zipfile.ZipFile(
+                        tmp_path, "w", zipfile.ZIP_DEFLATED
+                    ) as zf:
+                        zf.writestr(f"{doc_id}_v{version}.png", artifact)
+                        zf.writestr(
+                            "preview.json",
+                            json.dumps(manifest, ensure_ascii=False, indent=2),
+                        )
+                except OSError as exc:
+                    _error(
+                        500,
+                        "preview_package_write_failed",
+                        f"failed to fully write the preview package ZIP: {exc}",
+                    )
+            # 事务已提交：本次领取核销完成，即使撤回此刻生效也照常交付。
+        except Exception:
+            _cleanup_tempfile(tmp_path)
+            raise
+        background_tasks.add_task(_cleanup_tempfile, tmp_path)
+        return FileResponse(
+            tmp_path,
+            media_type="application/zip",
+            filename=f"publication-preview-{doc_id}-v{version}.zip",
+        )
+
     # ---------------- 服务数据归档（同一数据库快照，全有或全无 ZIP） ----------------
 
     @app.post("/service-data-archives")
@@ -1847,6 +2113,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "documents", "annotation_rects", "publications",
             "publication_batches", "batch_publications",
             "batch_idempotency", "publication_withdrawals",
+            "preview_tokens",
         ):
             # 表名全部来自上方字面量，不存在注入面
             rows = conn.execute(
@@ -2056,8 +2323,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         恢复内容：文档、各修订标注、发布与批次关系、撤回记录及对应原图/
         成品文件；ID、版本号、摘要与各类时间原样保留，本机文件路径按当前
         ``DATA_DIR`` 重建。归档不包含批次幂等键，``batch_idempotency``
-        **不推断恢复**（旧键重放按新键处理）。成功返回各类恢复计数；
-        既有查询与公开接口随即按恢复记录及原 ``publish_at``/撤回规则工作。
+        **不推断恢复**（旧键重放按新键处理）；归档同样不包含内审预览凭证，
+        ``preview_tokens`` 在恢复出的实例上为空，**旧凭证一律不能沿用**。
+        成功返回各类恢复计数；既有查询与公开接口随即按恢复记录及原
+        ``publish_at``/撤回规则工作。
         """
         # 流式落系统临时文件，避免大归档整体驻留内存；绝不直接写 DATA_DIR。
         tmp_fd, tmp_path = tempfile.mkstemp(prefix="svc-restore-", suffix=".zip")

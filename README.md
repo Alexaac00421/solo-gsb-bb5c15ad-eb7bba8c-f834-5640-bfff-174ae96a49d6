@@ -18,6 +18,12 @@
 版本只要出现一项即**整包拒绝**且不泄露该项成品/遮盖详情；重复项、数量越界同样明确
 报错。打包的资格确认与撤回**串行**：撤回先生效则拒绝，打包先确认则本次交付完成。
 
+定时公开前需要内审时，管理员可凭本地配置的密钥（`PREVIEW_ADMIN_KEY`）为某个
+**未到公开时间**的版本颁发**一次性预览凭证**（1～60 分钟有效期，服务端只存摘要）；
+内审员持凭证在**到期与公开时间之前**领取一份**预览包**（ZIP：仅该版成品 PNG 与
+发布时冻结的遮盖信息，**绝不包含原图**）。凭证校验与核销在同一写事务内原子完成，
+并发领取仅一笔成功；过期、已用或无效凭证统一 404，不泄露任何版本信息。
+
 ## 一键启动（Docker Compose）
 
 ```bash
@@ -52,6 +58,7 @@ python -m pytest tests/ -q
 | `MAX_UPLOAD_MB` | `25`     | 单个上传文件大小上限（MB）                 |
 | `MAX_VERIFY_MB` | `512`    | 归档核验上传 ZIP 大小上限（MB）；核验只读临时文件、不解压到 `DATA_DIR` |
 | `MAX_RESTORE_MB` | `512`   | 归档恢复上传 ZIP 大小上限（MB）；恢复先落系统临时目录，核验通过才写入 `DATA_DIR` |
+| `PREVIEW_ADMIN_KEY` | 未设置 | 内审预览凭证的管理密钥（仅本机环境变量配置，不入库）；未设置时颁发端点整体不可用（503），其余功能不受影响 |
 
 监听地址/端口通过 uvicorn 参数（`--host`/`--port`）或 Compose 的 `ports` 映射调整。
 首次启动时应用自动建目录、建表（初始化无需手工步骤）。
@@ -75,6 +82,8 @@ python -m pytest tests/ -q
 | GET  | `/publications/{doc_id}/{version}/image` | 公开读取：发布版 PNG（未到公开时间 404） |
 | POST | `/documents/{doc_id}/coverage-diff` | **重发前遮盖范围比较**（只读）：当前标注修订号 + 基准发布版本号 → 新增/失去遮盖像素数、占旋正后图像比例、失去遮盖水平段 |
 | POST | `/publication-packages` | **离线交付包**：按请求顺序提交 2～20 个互不重复的 `(doc_id, version)`，成功返回 ZIP（各版 PNG + `manifest.json` 清单）；任一项未知/未到公开时间/已撤回即整包拒绝 |
+| POST | `/publication-previews` | **内审预览凭证颁发**：凭请求头 `X-Preview-Admin-Key`（本地 `PREVIEW_ADMIN_KEY` 配置）提交 `{"doc_id","version","expires_in_minutes"}`（1～60 分钟），为未到公开时间的版本取得一次性凭证与截止时间 |
+| GET  | `/publication-previews/{token}` | **内审预览包领取**：到期与公开时间之前返回 ZIP（仅该版成品 PNG + 发布时冻结的遮盖信息，绝不包含原图）；一次性核销，过期/已用/无效统一 404 |
 | POST | `/service-data-archives` | **服务数据归档（运维）**：无请求体，返回同一数据库快照的 ZIP——文档/标注/发布/撤回记录 + 该快照引用的原图与发布成品（相对路径）+ `manifest.json`（SHA-256、文档/版本标识、文件数）；任一引用文件缺失或摘要不符即整单拒绝 |
 | POST | `/service-data-archives/verify` | **归档核验（运维交接前，纯只读）**：上传归档 ZIP（multipart 字段 `file`），核对成员名唯一且均为规定相对路径、清单与实际成员一一对应、计数与 SHA-256 匹配，以及文档↔连续标注修订↔发布版本↔批次成员顺序↔撤回记录的引用关系与原图/成品摘要；通过返回各类记录计数，失败返回可定位原因并整体判失败。**不解压到服务数据目录、不改写任何现有记录** |
 | POST | `/service-data-archives/restore` | **归档恢复（运维，空实例整体恢复）**：上传归档 ZIP（multipart 字段 `file`），先按核验同一口径检查全部成员与记录关系，再在**一个写事务**内完成空实例判定（业务库为空且原图/成品目录无业务文件）、文件落盘（独占创建、绝不覆盖）与全部记录写入；ID/版本/摘要/时间保留，本机路径按当前 `DATA_DIR` 重建；成功返回各类恢复计数。无效归档 400、非空实例 409、目标冲突 409、写入失败 500，均不留部分记录或本次文件 |
@@ -571,6 +580,80 @@ manifest.json
 端到端示例（含成功交付校验与各类整包拒绝）：`bash examples/demo_package.sh`。
 
 
+## 内审预览凭证（定时公开前的一次性预览包）
+
+档案员需要把某个**已生成但尚未到公开时间**的脱敏版本交给内审员预览时，
+管理员凭**本地配置的密钥**（环境变量 `PREVIEW_ADMIN_KEY`，不入库、不出现在
+任何响应中）调用 `POST /publication-previews`，在请求头
+`X-Preview-Admin-Key` 中携带密钥，请求体提交**文档 ID、版本号与
+1～60 分钟有效期**：
+
+```bash
+BASE=http://localhost:8000
+# 服务启动时配置：PREVIEW_ADMIN_KEY=local-preview-key
+curl -sS -X POST "$BASE/publication-previews" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Preview-Admin-Key: local-preview-key' \
+  -d "{\"doc_id\":\"$DOC_ID\",\"version\":1,\"expires_in_minutes\":30}"
+# -> 201
+# {"token":"zIqm8DiX…","doc_id":"…","version":1,
+#  "publish_at":"2026-10-07T01:13:19Z",
+#  "expires_at":"2026-10-07T01:42:54Z","created_at":"…"}
+```
+
+- **颁发门槛**：仅对**设置了未来公开时间**的版本颁发——立即公开
+  （`publish_at` 为 `null`）或公开时间已过的版本返回
+  `409 publication_not_scheduled`；版本不存在沿用 404
+  `document_not_found`/`unknown_version`；已撤回版本 410
+  `publication_withdrawn`（撤回优先，与公开读取同序）；有效期不在
+  1～60 分钟返回 `400 invalid_preview_ttl`。密钥未携带或与本地配置不符
+  统一 `401 preview_admin_key_invalid`（恒定时间比较，不区分缺失/错误）；
+  服务端未配置 `PREVIEW_ADMIN_KEY` 时颁发端点整体不可用
+  （`503 preview_admin_key_not_configured`），其余功能不受影响。
+  任何拒绝都不留下凭证记录。
+- **凭证只存摘要**：明文是 256 位随机 URL 安全字符串，只在颁发响应中
+  出现一次；库中 `preview_tokens` 表只存其 SHA-256 摘要、目标版本、
+  截止时间与核销时间，**绝不存明文**。
+- **领取窗口**：内审员在**凭证到期之前且版本公开时间到达之前**调用
+  `GET /publication-previews/{token}` 领取预览包；公开时间一到，预览
+  窗口即关闭（此后走常规公开读取即可）。
+
+```bash
+curl -sS -o preview.zip "$BASE/publication-previews/$TOKEN"
+# -> 200，Content-Type: application/zip
+unzip -l preview.zip
+#   <doc_id>_v1.png    # 该版发布成品 PNG（与公开后将看到的文件一致）
+#   preview.json       # 发布时冻结的遮盖信息（矩形坐标/原因、成品 SHA-256 等）
+```
+
+- **预览包只含成品与冻结遮盖信息，绝不包含原图**：ZIP 内只有两项——
+  该版成品 PNG（文件名只由服务端文档 ID 与版本号生成）与
+  `preview.json`（`doc_id`/`version`/`annotation_revision`/
+  `output_sha256`/`redaction_count`/`redactions`（发布时冻结修订的矩形
+  与原因，不受后续标注修改影响）/`publish_at`/`generated_at`）；不含原图
+  文件，也不含原图摘要。
+- **一次性，校验与核销原子化**：凭证的"摘要检索 → 撤回/公开时间复查 →
+  成品读盘与摘要复算 → 核销 → 打包"全部在**同一个 `BEGIN IMMEDIATE`
+  写事务**内完成：并发领取被写锁串行，**仅一笔成功**，其余统一 404；
+  领取与撤回互斥串行——**撤回先提交则本次领取看到撤回记录而拒绝**
+  （410，凭证不核销），**领取先核销则本次下载照常完成**，撤回随后生效。
+  成品缺失/读盘失败/摘要不符（`artifact_missing`/`artifact_read_failed`/
+  `artifact_corrupt`，500）时事务回滚，**凭证保持未核销**，可修复后重试。
+- **统一拒绝，不泄露版本信息**：未知、过期、已核销或预览窗口已关闭的
+  凭证一律返回相同的 `404 preview_token_invalid` 错误体，不区分原因，
+  也不携带文档 ID、版本号等任何版本信息。
+- **公开门面控不变**：凭证的颁发与领取不影响 `/publications/...`——
+  未到公开时间的版本对公开面仍是 404，到点后自动可读；已撤回版本恒为
+  410。预览包 ZIP 为服务端临时文件，响应发送完成后自动清理。
+- **不进入归档、恢复后不可沿用**：`preview_tokens` 不进入服务数据归档
+  （归档仍只含五类记录 JSON 与引用文件），恢复出的实例上该表为空，
+  **旧凭证一律不能沿用**（统一 404）；归档恢复的空实例判定把
+  `preview_tokens` 一并纳入业务表检查。
+
+端到端示例（颁发 → 领取 → 一次性/窗口/拒绝演示）：
+`PREVIEW_ADMIN_KEY=local-preview-key bash examples/demo_preview.sh`。
+
+
 ## 服务数据归档（同一数据库快照，全有或全无）
 
 运维人员需要导出某一**一致时点**的全部服务数据时，调用
@@ -838,11 +921,17 @@ BASE=http://localhost:8000 TARGET_BASE=http://localhost:8001 \
 | 409 | `idempotency_key_conflict` | 幂等键已用于不同内容的批次请求（原批次不受影响） |
 | 500 | `original_unavailable` | 存储的原图无法读取/解码（批次场景附 `position`/`doc_id`） |
 | 500 | `artifact_write_failed` | 发布成品写入磁盘失败（附 `position`/`doc_id`/`version`） |
-| 500 | `artifact_missing` | 发布成品在磁盘上缺失（单份图片读取；离线交付包附 `position`/`doc_id`/`version`） |
-| 500 | `artifact_read_failed` | 离线交付包读成品文件失败（附 `position`/`doc_id`/`version`） |
-| 500 | `artifact_corrupt` | 离线交付包中成品实际 SHA-256 与发布记录不符（附 `position`/`doc_id`/`version`） |
+| 500 | `artifact_missing` | 发布成品在磁盘上缺失（单份图片读取；预览领取与离线交付包附 `doc_id`/`version`，交付包另附 `position`） |
+| 500 | `artifact_read_failed` | 预览领取/离线交付包读成品文件失败（附 `doc_id`/`version`，交付包另附 `position`） |
+| 500 | `artifact_corrupt` | 预览领取/离线交付包中成品实际 SHA-256 与发布记录不符（附 `doc_id`/`version`，交付包另附 `position`） |
 | 400 | `invalid_package_size` | 离线交付包条目数不在 2～20（附 `count`） |
 | 400 | `duplicate_item_in_package` | 交付包内 `(doc_id, version)` 对重复（附 `position`/`doc_id`/`version`） |
+| 401 | `preview_admin_key_invalid` | 预览凭证颁发请求未携带或携带错误的管理密钥（统一拒绝，不区分缺失/错误） |
+| 503 | `preview_admin_key_not_configured` | 服务端未配置 `PREVIEW_ADMIN_KEY`，预览凭证颁发端点整体不可用 |
+| 400 | `invalid_preview_ttl` | 预览凭证有效期不在 1～60 分钟（附 `expires_in_minutes`） |
+| 409 | `publication_not_scheduled` | 预览凭证目标版本未设置未来公开时间（立即公开或公开时间已过，附 `doc_id`/`version`） |
+| 404 | `preview_token_invalid` | 预览凭证未知、过期、已核销或预览窗口已关闭（统一错误体，不泄露任何版本信息） |
+| 500 | `preview_package_write_failed` | 预览包 ZIP 写盘失败（临时文件已清理，凭证未核销） |
 | 500 | `archive_original_missing` | 服务数据归档引用的原图在磁盘上缺失（附 `doc_id`，整单拒绝） |
 | 500 | `archive_original_read_failed` | 归档读取原图失败（附 `doc_id`，整单拒绝） |
 | 500 | `archive_original_corrupt` | 归档原图实际 SHA-256 与快照记录不符（附 `doc_id`，整单拒绝） |
@@ -933,6 +1022,17 @@ BASE=http://localhost:8000 TARGET_BASE=http://localhost:8001 \
   才生效，本次交付完成；包内 PNG 文件名只由请求位置、服务端文档 ID 与版本号
   生成，不取自上传文件名，`manifest.json` 按请求顺序记录文档 ID、版本号、
   成品 SHA-256、遮盖数与包内文件名。
+- **内审预览凭证**：`POST /publication-previews` 的颁发（管理密钥恒定时间
+  比较、版本存在性、撤回优先、未来公开时间判定）与
+  `GET /publication-previews/{token}` 的领取都在 `BEGIN IMMEDIATE` 写事务
+  内与既有写操作串行。库中只存凭证明文的 SHA-256 摘要；领取的"摘要检索 →
+  撤回复查 → 成品摘要复算 → 核销 → 打包"在同一写事务内原子完成——并发
+  领取仅一笔看到未核销状态，其余统一 `404 preview_token_invalid`（未知/
+  过期/已用/窗口关闭同形态，不泄露版本信息）；与撤回互斥：撤回先提交则
+  领取拒绝（410）且不核销，领取先核销则本次下载完成、撤回随后生效。预览包
+  仅含该版成品 PNG 与发布时冻结修订的遮盖信息，绝不包含原图；公开面
+  `/publications/...` 的到点前 404 门控不受凭证影响。`preview_tokens` 不
+  进入服务数据归档，恢复出的实例不含任何凭证，旧凭证不能沿用。
 - **服务数据归档恢复**：`POST /service-data-archives/restore` 先把上传 ZIP
   流式落到系统临时目录并按核验端点**同一口径**检查全部成员与记录关系（失败
   即 `400 invalid_archive`，不产生任何副作用）；随后在**一个** `BEGIN
@@ -1011,6 +1111,11 @@ tests/test_coverage_diff.py  # 31 个用例：新增/失去像素数与占比、
                              #   基准冻结不受后续修改影响、未知/未到点/撤回不
                              #   泄露详情、修订过期、纯只读、并发标注下同一快照、
                              #   纯几何区间并集/相减
+tests/test_preview.py        # 16 个用例：颁发（密钥缺失/错误/未配置、有效期
+                             #   边界、版本不存在、未设未来公开时间、已撤回）、
+                             #   摘要存储、领取一次性与统一 404、冻结遮盖信息、
+                             #   公开时间窗口、领取与撤回串行、并发仅一笔成功、
+                             #   成品复查失败不核销、归档不含凭证且恢复后无效
 examples/demo.sh             # 单份端到端 curl 示例
 examples/demo_batch.sh       # 批次发布端到端 curl 示例
 examples/demo_idempotency.sh # 批次幂等键端到端 curl 示例
@@ -1022,10 +1127,43 @@ examples/demo_archive_verify.sh  # 归档核验（有效计数 + 篡改后可定
 examples/demo_restore.sh     # 归档恢复（源实例取归档 -> 空目标实例恢复 -> 拒绝演示）端到端示例
 examples/demo_migration.sh   # 遮盖方案迁移端到端 curl 示例
 examples/demo_coverage_diff.sh  # 重发前遮盖范围比较端到端 curl 示例
+examples/demo_preview.sh     # 内审预览凭证（颁发 -> 领取 -> 一次性/窗口/拒绝）端到端示例
 Dockerfile / docker-compose.yml
 ```
 
-## 本轮变动（服务数据归档恢复）
+## 本轮变动（内审预览凭证）
+
+- 新增 `POST /publication-previews`（颁发）与
+  `GET /publication-previews/{token}`（领取）：管理员凭本地配置的管理密钥
+  （环境变量 `PREVIEW_ADMIN_KEY`，请求头 `X-Preview-Admin-Key` 提交）为
+  **未到公开时间**的已发布版本颁发**一次性预览凭证**（1～60 分钟有效期）；
+  内审员持凭证在**到期与公开时间之前**领取预览包 ZIP——仅含该版成品 PNG
+  与 `preview.json`（发布时冻结的遮盖矩形/原因、成品 SHA-256 等），
+  **绝不包含原图**。
+- **颁发门槛**：密钥未携带/错误统一 `401 preview_admin_key_invalid`
+  （恒定时间比较）；服务端未配置密钥时颁发端点整体不可用
+  `503 preview_admin_key_not_configured`；有效期越界
+  `400 invalid_preview_ttl`；版本不存在沿用 404；未设置未来公开时间
+  `409 publication_not_scheduled`；已撤回 `410 publication_withdrawn`；
+  任何拒绝不留凭证记录。
+- **凭证只存摘要、核销原子化**：新增表 `preview_tokens`（凭证明文的
+  SHA-256 摘要、目标版本、截止/核销时间；旧数据卷启动时自动建表），明文
+  只在颁发响应出现一次。领取的"校验 → 撤回复查 → 成品摘要复算 → 核销 →
+  打包"在同一个 `BEGIN IMMEDIATE` 写事务内完成：并发领取仅一笔成功；
+  撤回先提交则领取拒绝（410，不核销），领取先核销则本次下载完成；成品
+  缺失/损坏（500）时凭证保持未核销。未知/过期/已用/窗口关闭统一
+  `404 preview_token_invalid`，不泄露版本信息。
+- **既有语义不变**：`/publications/...` 到点前 404、到点可读、撤回 410
+  的门控不受凭证影响；发布、批次、幂等键、撤回、离线交付包、归档/核验/
+  恢复的路由与字段均未改动；未配置密钥时既有功能完全不受影响。
+- **不进入归档**：`preview_tokens` 不进入服务数据归档（归档仍只含五类
+  记录 JSON 与引用文件），恢复出的实例不含任何凭证，**旧凭证不能沿用**；
+  归档恢复的空实例判定把 `preview_tokens` 纳入业务表检查。
+- 新增配置项 `PREVIEW_ADMIN_KEY`、测试 `tests/test_preview.py`
+  （16 个用例）与示例 `examples/demo_preview.sh`；启动方式
+  （Docker Compose / uvicorn）不变。
+
+## 历史变动（服务数据归档恢复）
 
 - 新增 `POST /service-data-archives/restore`：运维把本服务导出的归档 ZIP
   整体恢复到**空实例**（`multipart/form-data`，字段名 `file`）。上传先流式

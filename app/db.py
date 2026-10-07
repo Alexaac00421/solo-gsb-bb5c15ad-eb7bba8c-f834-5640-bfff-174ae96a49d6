@@ -25,6 +25,11 @@
   写入互不干扰；事务纯只读，不产生版本、不写入任何改动记录。归档还会在该事务
   内读取引用文件（原图/成品）并复算摘要：这些文件落盘后不可变，故快照记录与
   文件字节同属一个一致时点；读盘期间不持写锁，并发写入同样不受阻塞。
+- 内审预览凭证（preview_tokens）只存凭证明文的 SHA-256 摘要，绝不存明文；
+  凭证的"校验 -> 核销"与撤回复查、成品摘要复查、预览包生成都在同一个
+  ``BEGIN IMMEDIATE`` 写事务内完成，因此并发领取只有一笔能看到未核销状态，
+  且与撤回互斥串行。该表不进入服务数据归档：归档恢复出的实例不含任何凭证，
+  旧凭证在恢复后的实例上一律无效。
 """
 from __future__ import annotations
 
@@ -103,6 +108,16 @@ CREATE TABLE IF NOT EXISTS publication_withdrawals (
     reason       TEXT NOT NULL,             -- 首次撤回时的原因（重复撤回不改写）
     withdrawn_at TEXT NOT NULL,             -- 首次撤回时间
     PRIMARY KEY (doc_id, version),
+    FOREIGN KEY (doc_id, version) REFERENCES publications(doc_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS preview_tokens (
+    token_digest TEXT PRIMARY KEY,          -- 凭证明文的 SHA-256，绝不存明文
+    doc_id       TEXT NOT NULL,
+    version      INTEGER NOT NULL,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,             -- 统一 UTC 截止时间（ISO 8601，尾部 Z）
+    used_at      TEXT,                      -- NULL=未核销；核销与校验同一写事务
     FOREIGN KEY (doc_id, version) REFERENCES publications(doc_id, version)
 );
 """
